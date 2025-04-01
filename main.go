@@ -25,7 +25,6 @@ var (
 func check(hash string) (bool, error) {
 	hash = strings.ToUpper(hash)
 	prefix := hash[:5]
-	oldEtag := attemptLoadEtag(prefix)
 	cacheDir := filepath.Join(CacheDir, prefix)
 
 	lock.Lock()
@@ -54,6 +53,8 @@ func check(hash string) (bool, error) {
 
 		return searchFile(hash, f)
 	}
+
+	oldEtag := attemptLoadEtag(prefix)
 
 	req, err := http.NewRequest(http.MethodGet, "https://api.pwnedpasswords.com/range/"+prefix+"?mode=ntlm", nil)
 	if err != nil {
@@ -178,38 +179,57 @@ func main() {
 			found bool
 		}
 
-		limit := make(chan struct{}, 10)
-		output := make(chan Result)
+		jobs := make(chan string)
+		results := make(chan Result)
+
+		const maxWorkers = 10
+
+		var wg sync.WaitGroup
+		for range maxWorkers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for hash := range jobs {
+					found, err := check(hash)
+					if err != nil {
+						log.Printf("Error checking hash %s: %v\n", hash, err)
+						continue
+					}
+					results <- Result{
+						hash:  hash,
+						found: found,
+					}
+				}
+			}()
+		}
+
+		done := make(chan struct{})
+		go func() {
+			for result := range results {
+				fmt.Printf("%s:%v\n", result.hash, result.found)
+			}
+			done <- struct{}{}
+		}()
+
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
 			hash := strings.TrimSpace(scanner.Text())
 			if len(hash) != 32 {
-				log.Fatal("hash is an invalid length: ", hash, "should be 32 was: ", len(hash))
+				log.Printf("Hash is an invalid length: %s (should be 32, was: %d). Skipping.\n", hash, len(hash))
 				continue
 			}
-
-			limit <- struct{}{}
-			go func() {
-				defer func() {
-					<-limit
-				}()
-				found, err := check(hash)
-				if err != nil {
-					log.Println(err)
-					return
-				}
-
-				output <- Result{
-					found: found,
-					hash:  hash,
-				}
-			}()
-
+			jobs <- hash
 		}
 
 		if err := scanner.Err(); err != nil {
-			log.Fatal(err)
+			log.Printf("Error scanning file: %v\n", err)
 		}
+
+		close(jobs)
+		wg.Wait()
+		close(results)
+
+		<-done
 		return
 	}
 
